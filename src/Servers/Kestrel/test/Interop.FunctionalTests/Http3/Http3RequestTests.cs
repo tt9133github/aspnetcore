@@ -1,6 +1,7 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
+using System.Diagnostics.Tracing;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -13,41 +14,14 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.Server.Kestrel.FunctionalTests;
 using Microsoft.AspNetCore.Testing;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Interop.FunctionalTests.Http3
 {
     public class Http3RequestTests : LoggedTest
     {
-        private class StreamingHttpContext : HttpContent
-        {
-            private readonly TaskCompletionSource _completeTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            private readonly TaskCompletionSource<Stream> _getStreamTcs = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            protected override async Task SerializeToStreamAsync(Stream stream, TransportContext context)
-            {
-                _getStreamTcs.TrySetResult(stream);
-
-                await _completeTcs.Task;
-            }
-
-            protected override bool TryComputeLength(out long length)
-            {
-                length = -1;
-                return false;
-            }
-
-            public Task<Stream> GetStreamAsync()
-            {
-                return _getStreamTcs.Task;
-            }
-
-            public void CompleteStream()
-            {
-                _completeTcs.TrySetResult();
-            }
-        }
-
         private static readonly byte[] TestData = Encoding.UTF8.GetBytes("Hello world");
 
         [ConditionalFact]
@@ -59,19 +33,9 @@ namespace Interop.FunctionalTests.Http3
             {
                 var body = context.Request.Body;
 
-                var data = new List<byte>();
-                var buffer = new byte[1024];
-                var readCount = 0;
-                while ((readCount = await body.ReadAsync(buffer).DefaultTimeout()) != -1)
-                {
-                    data.AddRange(buffer.AsMemory(0, readCount).ToArray());
-                    if (data.Count == TestData.Length)
-                    {
-                        break;
-                    }
-                }
+                var data = await ReadLengthAsync(body, TestData.Length);
 
-                await context.Response.Body.WriteAsync(buffer.AsMemory(0, TestData.Length));
+                await context.Response.Body.WriteAsync(data);
             });
 
             using (var host = builder.Build())
@@ -106,6 +70,88 @@ namespace Interop.FunctionalTests.Http3
 
                 await host.StopAsync();
             }
+        }
+
+        [ConditionalFact]
+        [MsQuicSupported]
+        public async Task GET_ClientCancellationAfterResponseReceived_ClientGetsResponse()
+        {
+            // Arrange
+            using var httpEventListener = new EventSourceListener(TestOutputHelper);
+
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var builder = CreateHttp3HostBuilder(async context =>
+            {
+                Logger.LogInformation("Flush headers on server");
+                await context.Response.Body.FlushAsync();
+
+                var body = context.Request.Body;
+
+                Logger.LogInformation("Server read body");
+                var data = await ReadLengthAsync(body, TestData.Length);
+
+                await context.Response.Body.WriteAsync(data);
+                await context.Response.Body.FlushAsync();
+
+                await tcs.Task;
+            });
+
+            using (var host = builder.Build())
+            using (var client = new HttpClient())
+            {
+                await host.StartAsync();
+
+                var requestContent = new StreamingHttpContext();
+
+                var request = new HttpRequestMessage(HttpMethod.Post, $"https://127.0.0.1:{host.GetPort()}/");
+                request.Content = requestContent;
+                request.Version = HttpVersion.Version30;
+                request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+
+                // Act
+                var responseTask = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+                var requestStream = await requestContent.GetStreamAsync();
+
+                // Send headers
+                await requestStream.FlushAsync();
+                // Write content
+                await requestStream.WriteAsync(TestData);
+
+                Logger.LogInformation("Waiting for headers on client");
+                var response = await responseTask;
+
+                // Assert
+                response.EnsureSuccessStatusCode();
+                Assert.Equal(HttpVersion.Version30, response.Version);
+                var stream = await response.Content.ReadAsStreamAsync();
+
+                Logger.LogInformation("Client read body");
+                var data = await ReadLengthAsync(stream, TestData.Length);
+
+                // Cancellation
+                response.Dispose();
+
+                await host.StopAsync();
+            }
+        }
+
+        private static async Task<Memory<byte>> ReadLengthAsync(Stream body, int length)
+        {
+            var data = new List<byte>();
+            var buffer = new byte[1024];
+            var readCount = 0;
+            while ((readCount = await body.ReadAsync(buffer)) != -1)
+            {
+                data.AddRange(buffer.AsMemory(0, readCount).ToArray());
+                if (data.Count == length)
+                {
+                    break;
+                }
+            }
+
+            return buffer.AsMemory(0, length);
         }
 
         [ConditionalFact]
@@ -257,6 +303,82 @@ namespace Interop.FunctionalTests.Http3
                             options.IdleTimeout = TimeSpan.FromSeconds(20);
                         });
                 });
+        }
+
+        private class StreamingHttpContext : HttpContent
+        {
+            private readonly TaskCompletionSource _completeTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly TaskCompletionSource<Stream> _getStreamTcs = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            protected override async Task SerializeToStreamAsync(Stream stream, TransportContext context)
+            {
+                _getStreamTcs.TrySetResult(stream);
+
+                await _completeTcs.Task;
+            }
+
+            protected override bool TryComputeLength(out long length)
+            {
+                length = -1;
+                return false;
+            }
+
+            public Task<Stream> GetStreamAsync()
+            {
+                return _getStreamTcs.Task;
+            }
+
+            public void CompleteStream()
+            {
+                _completeTcs.TrySetResult();
+            }
+        }
+
+        private sealed class EventSourceListener : EventListener
+        {
+            private readonly StringBuilder _messageBuilder = new StringBuilder();
+            private readonly ITestOutputHelper _output;
+
+            public EventSourceListener(ITestOutputHelper output)
+            {
+                _output = output;
+            }
+
+            protected override void OnEventSourceCreated(EventSource eventSource)
+            {
+                base.OnEventSourceCreated(eventSource);
+
+                if (eventSource.Name.Contains("System.Net.Quic") ||
+                    eventSource.Name.Contains("System.Net.Http"))
+                {
+                    EnableEvents(eventSource, EventLevel.LogAlways, EventKeywords.All);
+                }
+            }
+
+            protected override void OnEventWritten(EventWrittenEventArgs eventData)
+            {
+                base.OnEventWritten(eventData);
+
+                string message;
+                lock (_messageBuilder)
+                {
+                    _messageBuilder.Append("<- Event ");
+                    _messageBuilder.Append(eventData.EventSource.Name);
+                    _messageBuilder.Append(" - ");
+                    _messageBuilder.Append(eventData.EventName);
+                    _messageBuilder.Append(" : ");
+                    _messageBuilder.AppendJoin(',', eventData.Payload!);
+                    _messageBuilder.Append(" ->");
+                    message = _messageBuilder.ToString();
+                    _messageBuilder.Clear();
+                }
+                _output.WriteLine(message);
+            }
+
+            public override string ToString()
+            {
+                return _messageBuilder.ToString();
+            }
         }
     }
 }
