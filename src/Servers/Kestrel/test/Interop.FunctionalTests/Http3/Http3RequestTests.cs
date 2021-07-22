@@ -104,8 +104,10 @@ namespace Interop.FunctionalTests.Http3
                 await tcs.Task;
             });
 
+            var socketsHttpHandler = new SocketsHttpHandler();
+
             using (var host = builder.Build())
-            using (var client = new HttpClient())
+            using (var client = new HttpClient(socketsHttpHandler))
             {
                 await host.StartAsync();
 
@@ -119,22 +121,22 @@ namespace Interop.FunctionalTests.Http3
                 // Act
                 var responseTask = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
-                var requestStream = await requestContent.GetStreamAsync();
+                var requestStream = await requestContent.GetStreamAsync().DefaultTimeout();
 
                 // Send headers
-                await requestStream.FlushAsync();
+                await requestStream.FlushAsync().DefaultTimeout();
                 // Write content
-                await requestStream.WriteAsync(TestData);
+                await requestStream.WriteAsync(TestData).DefaultTimeout();
 
-                var response = await responseTask;
+                var response = await responseTask.DefaultTimeout();
 
                 // Assert
                 response.EnsureSuccessStatusCode();
                 Assert.Equal(HttpVersion.Version30, response.Version);
-                var stream = await response.Content.ReadAsStreamAsync();
+                var stream = await response.Content.ReadAsStreamAsync().DefaultTimeout();
 
                 Logger.LogInformation("Client read body");
-                var data = await ReadLengthAsync(stream, TestData.Length);
+                var data = await ReadLengthAsync(stream, TestData.Length).DefaultTimeout();
 
                 // Cancellation
                 Logger.LogInformation("Client canceling");

@@ -376,7 +376,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Internal
 
             _serverAborted = true;
 
-            _log.StreamAbort(this, abortReason.Message);
+            _log.StreamAbort(this, abortReason?.Message ?? string.Empty);
 
             lock (_shutdownLock)
             {

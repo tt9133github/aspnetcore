@@ -4,6 +4,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics.Tracing;
 using System.Net.Http;
 using System.Net.Quic;
 using System.Text;
@@ -15,6 +16,7 @@ using Microsoft.AspNetCore.Server.Kestrel.FunctionalTests;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Internal;
 using Microsoft.AspNetCore.Testing;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
 {
@@ -377,6 +379,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
         [MsQuicSupported]
         public async Task StreamPool_ManyConcurrentStreams_StreamPoolFull()
         {
+            using var httpEventListener = new EventSourceListener(TestOutputHelper);
+
+            const int StreamsSent = 10;
+            const int StreamsPooled = 10;
+
             // Arrange
             await using var connectionListener = await QuicTestHelpers.CreateConnectionListenerFactory(LoggerFactory);
 
@@ -398,13 +405,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
             var streamTasks = new List<Task>();
             var requestState = new RequestState(clientConnection, serverConnection, allConnectionsOnServerTcs, pauseCompleteTcs.Task);
 
-            const int StreamsSent = 101;
             for (var i = 0; i < StreamsSent; i++)
             {
                 // TODO: Race condition in QUIC library.
                 // Delay between sending streams to avoid
                 // https://github.com/dotnet/runtime/issues/55249
-                await Task.Delay(100);
+                //await Task.Delay(100);
                 streamTasks.Add(SendStream(requestState));
             }
 
@@ -415,7 +421,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
 
             // Assert
             // Up to 100 streams are pooled.
-            Assert.Equal(100, quicConnectionContext.StreamPool.Count);
+            Assert.Equal(StreamsPooled, quicConnectionContext.StreamPool.Count);
 
             static async Task SendStream(RequestState requestState)
             {
@@ -449,6 +455,53 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
                 // Both send and receive loops have exited.
                 await quicStreamContext._processingTask.DefaultTimeout();
                 await quicStreamContext.DisposeAsync();
+            }
+        }
+
+        private sealed class EventSourceListener : EventListener
+        {
+            private readonly StringBuilder _messageBuilder = new StringBuilder();
+            private readonly ITestOutputHelper _output;
+
+            public EventSourceListener(ITestOutputHelper output)
+            {
+                _output = output;
+            }
+
+            protected override void OnEventSourceCreated(EventSource eventSource)
+            {
+                base.OnEventSourceCreated(eventSource);
+
+                if (eventSource.Name.Contains("System.Net.Quic") ||
+                    eventSource.Name.Contains("System.Net.Http"))
+                {
+                    EnableEvents(eventSource, EventLevel.LogAlways, EventKeywords.All);
+                }
+            }
+
+            protected override void OnEventWritten(EventWrittenEventArgs eventData)
+            {
+                base.OnEventWritten(eventData);
+
+                string message;
+                lock (_messageBuilder)
+                {
+                    _messageBuilder.Append("<- Event ");
+                    _messageBuilder.Append(eventData.EventSource.Name);
+                    _messageBuilder.Append(" - ");
+                    _messageBuilder.Append(eventData.EventName);
+                    _messageBuilder.Append(" : ");
+                    _messageBuilder.AppendJoin(',', eventData.Payload!);
+                    _messageBuilder.Append(" ->");
+                    message = _messageBuilder.ToString();
+                    _messageBuilder.Clear();
+                }
+                _output.WriteLine(message);
+            }
+
+            public override string ToString()
+            {
+                return _messageBuilder.ToString();
             }
         }
 
