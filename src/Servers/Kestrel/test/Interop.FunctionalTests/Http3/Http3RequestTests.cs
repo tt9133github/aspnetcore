@@ -74,15 +74,21 @@ namespace Interop.FunctionalTests.Http3
 
         [ConditionalFact]
         [MsQuicSupported]
-        public async Task GET_ClientCancellationAfterResponseReceived_ClientGetsResponse()
+        public async Task Bidirectional_ClientCancellationAfterResponseReceived_ServerGetsCancellation()
         {
-            // Arrange
-            using var httpEventListener = new EventSourceListener(TestOutputHelper);
+            using var listener = new EventSourceListener(TestOutputHelper);
 
+            // Arrange
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
             var builder = CreateHttp3HostBuilder(async context =>
             {
+                context.RequestAborted.Register(() =>
+                {
+                    Logger.LogInformation("Server RequestAborted token raised.");
+                    tcs.TrySetResult();
+                });
+
                 Logger.LogInformation("Flush headers on server");
                 await context.Response.Body.FlushAsync();
 
@@ -94,6 +100,7 @@ namespace Interop.FunctionalTests.Http3
                 await context.Response.Body.WriteAsync(data);
                 await context.Response.Body.FlushAsync();
 
+                Logger.LogInformation("Server wait for abort");
                 await tcs.Task;
             });
 
@@ -119,7 +126,6 @@ namespace Interop.FunctionalTests.Http3
                 // Write content
                 await requestStream.WriteAsync(TestData);
 
-                Logger.LogInformation("Waiting for headers on client");
                 var response = await responseTask;
 
                 // Assert
@@ -131,7 +137,10 @@ namespace Interop.FunctionalTests.Http3
                 var data = await ReadLengthAsync(stream, TestData.Length);
 
                 // Cancellation
+                Logger.LogInformation("Client canceling");
                 response.Dispose();
+
+                await tcs.Task.DefaultTimeout();
 
                 await host.StopAsync();
             }
@@ -140,7 +149,7 @@ namespace Interop.FunctionalTests.Http3
         private static async Task<Memory<byte>> ReadLengthAsync(Stream body, int length)
         {
             var data = new List<byte>();
-            var buffer = new byte[1024];
+            var buffer = new byte[Math.Min(length, 1024)];
             var readCount = 0;
             while ((readCount = await body.ReadAsync(buffer)) != -1)
             {
