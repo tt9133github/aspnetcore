@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.FunctionalTests;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Internal;
 using Microsoft.AspNetCore.Testing;
+using Microsoft.Extensions.Logging;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -411,7 +412,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
                 // Delay between sending streams to avoid
                 // https://github.com/dotnet/runtime/issues/55249
                 //await Task.Delay(100);
-                streamTasks.Add(SendStream(requestState));
+                streamTasks.Add(SendStream(requestState, Logger, i + 1));
             }
 
             await allConnectionsOnServerTcs.Task.DefaultTimeout();
@@ -423,11 +424,16 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
             // Up to 100 streams are pooled.
             Assert.Equal(StreamsPooled, quicConnectionContext.StreamPool.Count);
 
-            static async Task SendStream(RequestState requestState)
+            static async Task SendStream(RequestState requestState, ILogger logger, int requestCount)
             {
+                //logger.LogInformation($"{requestCount} Sending stream");
                 var clientStream = requestState.QuicConnection.OpenBidirectionalStream();
                 await clientStream.WriteAsync(TestData, endStream: true).DefaultTimeout();
+
+                //logger.LogInformation($"{requestCount} Accepting stream on server");
                 var serverStream = await requestState.ServerConnection.AcceptAsync().DefaultTimeout();
+
+                //logger.LogInformation($"{requestCount} Accepting reading stream data on server");
                 var readResult = await serverStream.Transport.Input.ReadAtLeastAsync(TestData.Length).DefaultTimeout();
                 serverStream.Transport.Input.AdvanceTo(readResult.Buffer.End);
 
@@ -438,12 +444,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
                 lock (requestState)
                 {
                     requestState.ActiveConcurrentConnections++;
+                    //logger.LogInformation($"{requestCount} Current count on server is {requestState.ActiveConcurrentConnections}");
                     if (requestState.ActiveConcurrentConnections == StreamsSent)
                     {
                         requestState.AllConnectionsOnServerTcs.SetResult();
                     }
                 }
 
+                //logger.LogInformation($"{requestCount} Waiting for all streams to have reached server");
                 await requestState.PauseCompleteTask;
 
                 // Complete reading and writing.
@@ -454,6 +462,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Quic.Tests
 
                 // Both send and receive loops have exited.
                 await quicStreamContext._processingTask.DefaultTimeout();
+
+                //logger.LogInformation($"{requestCount} Disposing stream");
                 await quicStreamContext.DisposeAsync();
             }
         }
